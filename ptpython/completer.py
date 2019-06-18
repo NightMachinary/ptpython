@@ -6,6 +6,7 @@ from prompt_toolkit.contrib.regular_languages.completion import GrammarCompleter
 
 from ptpython.utils import get_jedi_script_from_document
 
+import keyword
 import re
 
 __all__ = (
@@ -17,11 +18,14 @@ class PythonCompleter(Completer):
     """
     Completer for Python code.
     """
-    def __init__(self, get_globals, get_locals):
+    def __init__(self, get_globals, get_locals, get_enable_dictionary_completion):
         super(PythonCompleter, self).__init__()
 
         self.get_globals = get_globals
         self.get_locals = get_locals
+        self.get_enable_dictionary_completion = get_enable_dictionary_completion
+
+        self.dictionary_completer = DictionaryCompleter(get_globals, get_locals)
 
         self._path_completer_cache = None
         self._path_completer_grammar_cache = None
@@ -108,8 +112,15 @@ class PythonCompleter(Completer):
         """
         Get Python completions.
         """
-        # Do Path completions
-        if complete_event.completion_requested or self._complete_path_while_typing(document):
+        # Do dictionary key completions.
+        has_dict_completions = False
+        if self.get_enable_dictionary_completion():
+            for c in self.dictionary_completer.get_completions(document, complete_event):
+                has_dict_completions = True
+                yield c
+
+        # Do Path completions (if there were no dictionary completions).
+        if not has_dict_completions and (complete_event.completion_requested or self._complete_path_while_typing(document)):
             for c in self._path_completer.get_completions(document, complete_event):
                 yield c
 
@@ -162,5 +173,62 @@ class PythonCompleter(Completer):
                     pass
                 else:
                     for c in completions:
-                        yield Completion(c.name_with_symbols, len(c.complete) - len(c.name_with_symbols),
-                                         display=c.name_with_symbols)
+                        yield Completion(
+                            c.name_with_symbols, len(c.complete) - len(c.name_with_symbols),
+                            display=c.name_with_symbols,
+                            style=_get_style_for_name(c.name_with_symbols))
+
+
+class DictionaryCompleter(Completer):
+    """
+    Experimental completer for Python dictionary keys.
+
+    Warning: This does an `eval` on the Python object before the open square
+             bracket, which is potentially dangerous. It doesn't match on
+             function calls, so it only triggers attribute access.
+    """
+    def __init__(self, get_globals, get_locals):
+        super(DictionaryCompleter, self).__init__()
+
+        self.get_globals = get_globals
+        self.get_locals = get_locals
+
+        self.pattern = re.compile(r'''([a-zA-Z_. \s]+)\[\s*['"]([^'"]*)$''')
+
+    def get_completions(self, document, complete_event):
+        match = self.pattern.search(document.text_before_cursor)
+        if match is not None:
+            object_var, key = match.groups()
+            object_var = object_var.strip()
+
+            # Do lookup of `object_var` in the context.
+            try:
+                result = eval(object_var, self.get_globals(), self.get_locals())
+            except BaseException as e:
+                return  # Many exception, like NameError can be thrown here.
+
+            # If this object is a dictionary, complete the keys.
+            if isinstance(result, dict):
+                for k in result:
+                    if isinstance(k, str) and k.startswith(key):
+                        yield Completion(k, - len(key), display=k)
+
+
+try:
+    import builtins
+    _builtin_names = dir(builtins)
+except ImportError:  # Python 2.
+    _builtin_names = []
+
+
+def _get_style_for_name(name):
+    """
+    Return completion style to use for this name.
+    """
+    if name in _builtin_names:
+        return 'class:completion.builtin'
+
+    if keyword.iskeyword(name):
+        return 'class:completion.keyword'
+
+    return ''
